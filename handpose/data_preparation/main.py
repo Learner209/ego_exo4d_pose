@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from handpose_dataloader import hand_pose_anno_loader
 from bodypose_dataloader import body_pose_anno_loader
+from collections import defaultdict
 from PIL import Image
 from projectaria_tools.core import calibration
 from scripts.download import find_annotated_takes
@@ -16,18 +17,25 @@ from utils.reader import PyAvReader
 from utils.utils import extract_aria_calib_to_json, get_ego_aria_cam_name
 from third_party.ego_exo4d_egopose.handpose.data_preparation.utils.utils import HAND_ORDER
 from egoego.utils.setup_logger import setup_logger
-from egoego.utils.geom import quat_between, quat_inv, quat_mul, quat_mul_vec, quat_normalize, normalize, align_exported_anno_to_slam_traj
+from egoego.utils.geom import pose_to_T, T_to_pose
 from egoego.utils.egoexo.egoexo_utils import EgoExoUtils
 from egoego.utils.aria.mps import AriaMPSService
+from projectaria_tools.utils.vrs_to_mp4_utils import get_timestamp_from_mp4, convert_vrs_to_mp4
+from third_party.ego_exo4d_egopose.handpose.data_preparation.data_conversion import EgoPoseDataPreparation
 
 logger = setup_logger(__name__)
 
 from egoego.utils.smpl_to_openpose.mapping import EGOEXO4D_EGOPOSE_BODYPOSE_MAPPINGS, EGOEXO4D_EGOPOSE_HANDPOSE_MAPPINGS, USED_SMPLH_JOINT_NAMES
+# from egoego.smplx_utils import NUM_OF_BODY_JOINTS as NUM_OF_SMPLH_BODY_JOINTS
+# from egoego.smplx_utils import NUM_OF_HAND_JOINTS as NUM_OF_SMPLH_HAND_JOINTS
 
 DEFICIENT_TAKE_NAMES = ["upenn_0722_Violin_1_3", "cmu_bike09_5", "georgiatech_bike_01_6"]
 
 BODY_JOINTS = EGOEXO4D_EGOPOSE_BODYPOSE_MAPPINGS
 HAND_JOINTS = EGOEXO4D_EGOPOSE_HANDPOSE_MAPPINGS
+NUM_OF_HAND_JOINTS = len(HAND_JOINTS) // 2
+NUM_OF_BODY_JOINTS = len(BODY_JOINTS)  
+NUM_OF_JOINTS = NUM_OF_BODY_JOINTS + NUM_OF_HAND_JOINTS * 2
 
 # region
 def undistort_aria_img(args):
@@ -451,7 +459,9 @@ def load_all_anno(args):
 def align_all_anno_with_slam_close_loop(args):
 
 	egoexo_utils = EgoExoUtils(args.ego4d_data_dir)
+	egopose_data_preparation = EgoPoseDataPreparation(args)
 	print(f"Aligning [{args.split}]/[{args.anno_types}] exported annotations with slam close loop traj paths ...")
+
 	for body_anno, hand_anno, anno_type, split in tqdm(load_all_anno(args)):
 
 		body_anno_keys = list(body_anno.keys())
@@ -460,6 +470,7 @@ def align_all_anno_with_slam_close_loop(args):
 		print(f"This split / anno type {len(common_keys)} hand & body annos, out of {len(body_anno_keys)} body annos and {len(hand_anno_keys)} hand annos")
 
 		for take_uid_idx, common_take_uid in tqdm(enumerate(common_keys), total=len(common_keys)):
+			# common_take_name = egoexo_utils.take_uid_to_take_names[common_take_uid]
 
 			this_take_body_anno = body_anno[common_take_uid]
 			this_take_hand_anno = hand_anno[common_take_uid]
@@ -477,10 +488,12 @@ def align_all_anno_with_slam_close_loop(args):
 			this_take_hand_anno_hand_bbox = []
 			this_take_body_anno_3d_body = []
 			this_take_body_anno_3d_valid_flag = []
+			this_take_ego_cam_extrs = []
+			this_take_ego_cam_intrs = []
 			this_take_body_anno_2d_kpts = []
 			this_take_body_anno_2d_bbox = []
 			
-			for frame_idx, common_frame_idx in enumerate(this_take_common_frame_keys):
+			for _, common_frame_idx in enumerate(this_take_common_frame_keys):
 				this_take_frame_body_anno = this_take_body_anno[common_frame_idx]
 				this_take_frame_hand_anno = this_take_hand_anno[common_frame_idx]
 				this_take_ego_cam_extr = this_take_hand_anno[common_frame_idx]["camera_extrinsics"]
@@ -512,6 +525,8 @@ def align_all_anno_with_slam_close_loop(args):
 				this_take_body_anno_3d_body.append(this_take_frame_body_anno_3d_body)
 				this_take_body_anno_3d_valid_flag.append(this_take_frame_body_anno_3d_valid_flag)
 
+				this_take_ego_cam_extrs.append(this_take_ego_cam_extr)
+				this_take_ego_cam_intrs.append(this_take_ego_cam_intr)
 				
 				this_take_frame_body_anno_2d_kpts = this_take_frame_body_anno["body_2d"] # 17 x 3
 				this_take_frame_body_anno_2d_bbox = this_take_frame_body_anno["body_bbox"] # 17 x 3
@@ -520,17 +535,182 @@ def align_all_anno_with_slam_close_loop(args):
 			this_take_body_anno_3d_valid_flag = np.stack(this_take_body_anno_3d_valid_flag, axis=0) # N x 17 x 3
 			this_take_hand_anno_3d_world = np.stack(this_take_hand_anno_3d_world, axis=0) # N x 42 x 3
 			this_take_hand_anno_3d_valid_flag = np.stack(this_take_hand_anno_3d_valid_flag, axis=0) # N x 42 x 3
+			this_take_anno_3d = np.concatenate([this_take_body_anno_3d_body, this_take_hand_anno_3d_world], axis=1) # N x (17+42) x 3
+			this_take_anno_3d_valid_flag = np.concatenate([this_take_body_anno_3d_valid_flag, this_take_hand_anno_3d_valid_flag], axis=1) # N x (17+42) x 3
 
-			# TODO: time synchronization here.
-			take_uid, take_name, take, open_loop_traj_path, close_loop_traj_path, gopro_calibs_path, cam_pose_anno_path, vrs_path, vrs_noimagestreams_path, online_calib_json_path = egoexo_utils.get_take_metadata_from_take_uid(common_take_uid)
-			aria_mps_serv = AriaMPSService(vrs_path, take, open_loop_traj_path, close_loop_traj_path, gopro_calibs_path, cam_pose_anno_path, None, None, online_calib_json_path, None)
-			aligned_take_body_anno_3d_body = align_exported_anno_to_slam_traj(this_take_body_anno_3d_body, common_take_uid) 
-	
-   
+			this_take_ego_cam_extrs = np.stack(this_take_ego_cam_extrs, axis=0) # N x 3 x 4
+			this_take_ego_cam_intrs = np.stack(this_take_ego_cam_intrs, axis=0) # N x 3 x 3
 
- 
+			this_take_ego_cam_traj = T_to_pose(this_take_ego_cam_extrs, take_inv=True) # N x 7
+
+			this_take_aligned_anno_3d = egopose_data_preparation.align_exported_anno_to_slam_traj(take_uid=common_take_uid, 
+															 egoexo_util_inst=egoexo_utils,
+															 this_take_ego_cam_traj = this_take_ego_cam_traj,
+															 this_take_ego_cam_int=this_take_ego_cam_intr,
+															 this_take_anno_3d=this_take_anno_3d,
+															 this_take_anno_3d_valid_flag=this_take_anno_3d_valid_flag)
+			this_take_body_aligned_anno_3d, this_take_hand_aligned_anno_3d = this_take_aligned_anno_3d[:, :NUM_OF_BODY_JOINTS, :], this_take_aligned_anno_3d[:, NUM_OF_BODY_JOINTS:, :]
+
+			for _, common_frame_idx in enumerate(this_take_common_frame_keys):
+				for hand_idx, hand_name in enumerate(HAND_ORDER):
+					this_take_hand_anno[common_frame_idx][f"{hand_name}_hand_3d_world"] = this_take_hand_aligned_anno_3d[common_frame_idx][hand_idx*NUM_OF_HAND_JOINTS:(hand_idx+1)*NUM_OF_HAND_JOINTS] # 21 x 3
+				 
+				this_take_body_anno[common_frame_idx]["body_3d"] = this_take_body_aligned_anno_3d[common_frame_idx] # 17 x 3
+			
+			body_anno[common_take_uid] = this_take_body_anno
+			hand_anno[common_take_uid] = this_take_hand_anno
+
+		aligned_anno_output_dir = os.path.join(
+			args.gt_output_dir, "annotation", anno_type
+		)
+		os.makedirs(aligned_anno_output_dir, exist_ok=True)
+		body_aligned_anno_output_path = os.path.join(aligned_anno_output_dir, f"ego_body_pose_gt_anno_{split}_public.json")
+		hand_aligned_anno_output_path = os.path.join(aligned_anno_output_dir, f"ego_hand_pose_gt_anno_{split}_public.json")
+
+		json.dump(body_anno, open(body_aligned_anno_output_path, "w"))
+		json.dump(hand_anno, open(hand_aligned_anno_output_path, "w"))
+		logger.info(f"Successfully writing to {body_aligned_anno_output_path} and {hand_aligned_anno_output_path} ! ")
+
+def load_all_aligned_anno(args):
+	for anno_type in args.anno_types:
+		for split in args.splits:
+			aligned_anno_output_dir = os.path.join(
+				args.gt_output_dir, "annotation", anno_type
+			)
+			body_aligned_anno_output_path = os.path.join(aligned_anno_output_dir, f"ego_body_pose_gt_anno_{split}_public.json")
+			hand_aligned_anno_output_path = os.path.join(aligned_anno_output_dir, f"ego_hand_pose_gt_anno_{split}_public.json")
+			yield json.load(open(body_aligned_anno_output_path)), json.load(open(hand_aligned_anno_output_path)), anno_type, split
+
 def generate_smpl_converted_anno(args):
-	pass
+	egopose_data_preparation = EgoPoseDataPreparation(args)
+	egoexo_utils = EgoExoUtils(args.ego4d_data_dir)
+
+	for (body_aligned_anno, hand_aligned_anno, anno_type, split) in tqdm(load_all_aligned_anno(args)):
+		body_anno_keys = list(body_aligned_anno.keys())
+		hand_anno_keys = list(hand_aligned_anno.keys())
+		common_keys = list(set(body_anno_keys).intersection(hand_anno_keys))
+		print(f"This split / anno type {len(common_keys)} hand & body annos, out of {len(body_anno_keys)} body annos and {len(hand_anno_keys)} hand annos")
+
+		smplh_aligned_anno = defaultdict(dict)
+		for take_uid_idx, common_take_uid in tqdm(enumerate(common_keys), total=len(common_keys)):
+			common_take_name = egoexo_utils.take_uid_to_take_names[common_take_uid]
+			smplh_aligned_anno[common_take_uid] = defaultdict(dict)
+
+			this_take_aligned_body_anno = body_aligned_anno[common_take_uid]
+			this_take_aligned_hand_anno = hand_aligned_anno[common_take_uid]
+			this_take_aligned_body_anno_frame_keys = list(this_take_aligned_body_anno.keys())
+			this_take_aligned_hand_anno_frame_keys = list(this_take_aligned_hand_anno.keys())
+			this_take_aligned_common_frame_keys = list(
+				set(this_take_aligned_body_anno_frame_keys).intersection(this_take_aligned_hand_anno_frame_keys)
+			)
+			print(f"This take has {len(this_take_aligned_common_frame_keys)} common frames, out of {len(this_take_aligned_body_anno_frame_keys)} body frames and {len(this_take_aligned_hand_anno_frame_keys)} hand frames")
+
+			this_take_aligned_hand_anno_3d_world = []
+			this_take_aligned_hand_anno_3d_valid_flag = []
+			this_take_aligned_body_anno_3d_body = []
+			this_take_aligned_body_anno_3d_valid_flag = []
+			
+			for _, common_frame_idx in enumerate(this_take_aligned_common_frame_keys):
+				this_take_aligned_frame_body_anno = this_take_aligned_body_anno[common_frame_idx]
+				this_take_aligned_frame_hand_anno = this_take_aligned_hand_anno[common_frame_idx]
+
+				this_take_aligned_frame_hand_anno_3d_world = []
+				this_take_aligned_frame_hand_anno_3d_valid_flag = []
+
+				for hand_idx, hand_name in enumerate(HAND_ORDER):
+
+					this_take_aligned_frame_hand_anno_3d_world.append(this_take_aligned_frame_hand_anno[f"{hand_name}_hand_3d_world"]) # 21 x 3
+					this_take_aligned_frame_hand_anno_3d_valid_flag.append(this_take_aligned_frame_hand_anno[f"{hand_name}_hand_valid_3d"]) # 21 x 3
+				 
+				this_take_aligned_frame_hand_anno_3d_world = np.stack(this_take_aligned_frame_hand_anno_3d_world, axis=0)
+				this_take_aligned_frame_hand_anno_3d_valid_flag = np.stack(this_take_aligned_frame_hand_anno_3d_valid_flag, axis=0)
+				this_take_aligned_hand_anno_3d_world.append(this_take_aligned_frame_hand_anno_3d_world)
+				this_take_aligned_hand_anno_3d_valid_flag.append(this_take_aligned_frame_hand_anno_3d_valid_flag)
+
+				this_take_aligned_frame_body_anno_3d_body = this_take_aligned_frame_body_anno["body_3d"] # 17 x 3
+				this_take_aligned_frame_body_anno_3d_valid_flag = this_take_aligned_frame_body_anno["body_valid_3d"] # 17 x 3
+				this_take_aligned_body_anno_3d_body.append(this_take_aligned_frame_body_anno_3d_body)
+				this_take_aligned_body_anno_3d_valid_flag.append(this_take_aligned_frame_body_anno_3d_valid_flag)
+			 
+			this_take_aligned_body_anno_3d_body = np.stack(this_take_aligned_body_anno_3d_body, axis=0)  # N x 17 x 3
+			this_take_aligned_body_anno_3d_valid_flag = np.stack(this_take_aligned_body_anno_3d_valid_flag, axis=0) # N x 17 x 3
+			this_take_aligned_hand_anno_3d_world = np.stack(this_take_aligned_hand_anno_3d_world, axis=0) # N x 42 x 3
+			this_take_aligned_hand_anno_3d_valid_flag = np.stack(this_take_aligned_hand_anno_3d_valid_flag, axis=0) # N x 42 x 3
+
+			this_take_aligned_anno_3d = np.concatenate([this_take_aligned_body_anno_3d_body, this_take_aligned_hand_anno_3d_world], axis=1) # N x (17+42) x 3
+			this_take_aligned_anno_3d_valid_flag = np.concatenate([this_take_aligned_body_anno_3d_valid_flag, this_take_aligned_hand_anno_3d_valid_flag], axis=1) # N x (17+42) x 3
+
+			this_take_smplh_anno_3d = egopose_data_preparation.generate_smpl_converted_anno(this_take_anno_3d=this_take_aligned_anno_3d, 
+																  this_take_anno_3d_valid_flag=this_take_aligned_anno_3d_valid_flag,
+																seq_name=common_take_name)
+
+			smplh_aligned_anno[common_take_uid][common_frame_idx]["smplh_aligned_pose"] = this_take_smplh_anno_3d # T x 52 x 3
+			smplh_aligned_anno[common_take_uid][common_frame_idx]["metadata"] = this_take_aligned_hand_anno["metadata"]
+
+		smplh_anno_output_dir = os.path.join(
+			args.gt_output_dir, "annotation", anno_type
+		)
+		os.makedirs(smplh_anno_output_dir, exist_ok=True)
+		smplh_aligned_anno_output_path = os.path.join(smplh_anno_output_dir, f"ego_body_pose_gt_anno_{split}_public.json")
+
+		json.dump(smplh_anno_output_dir, open(smplh_aligned_anno_output_path, "w"))
+		logger.info(f"Successfully writing to {smplh_aligned_anno_output_path} ! ")
+
+def convert_all_vrs_to_mp4(args):
+
+	# Load all takes metadata
+	takes = json.load(open(os.path.join(args.ego4d_data_dir, "takes.json")))
+
+	for anno_type in args.anno_types:
+		for split in args.splits:
+			# Load GT annotation
+			gt_anno_path = os.path.join(
+				args.gt_output_dir,
+				"annotation",
+				anno_type,
+				f"ego_pose_gt_anno_{split}_public.json",
+			)
+			# Check gt-anno file existence
+			if not os.path.exists(gt_anno_path):
+				print(
+					f"[Warning] Conversion of vrs to mp4 files fails for split={split}({anno_type}). Invalid path: {gt_anno_path}. Skipped for now."
+				)
+				continue
+			gt_anno = json.load(open(gt_anno_path))
+			# Input and output root path
+			take_video_dir = os.path.join(args.ego4d_data_dir, "takes")
+			mp4_output_root = os.path.join(
+				args.gt_output_dir, "exported_mp4", split
+			)
+			os.makedirs(mp4_output_root, exist_ok=True)
+			# Extract frames with annotations for all takes
+			print("Exporting Aria vrs to mp4...")
+			for i, (take_uid, take_anno) in enumerate(gt_anno.items()):
+				# Get current take's metadata
+				take = [t for t in takes if t["take_uid"] == take_uid]
+				assert len(take) == 1, f"Take: {take_uid} does not exist"
+				take = take[0]
+				# Get current take's name and aria camera name
+				take_name = take["take_name"]
+				print(f"[{i+1}/{len(gt_anno)}] processing {take_name}")
+				ego_aria_cam_name = get_ego_aria_cam_name(take)
+				# Load current take's aria video
+				curr_take_vrs_path = os.path.join(
+					take_video_dir,
+					take_name,
+					f"{ego_aria_cam_name}.vrs",
+				)
+				if not os.path.exists(curr_take_vrs_path):
+					print(
+						f"[Warning] No frame aligned videos found at {curr_take_vrs_path}. Skipped take {take_name}."
+					)
+					continue
+				curr_mp4_output_path = osp.join(mp4_output_root, f"{take_name}.mp4")
+				convert_vrs_to_mp4(vrs_file=curr_take_vrs_path, output_video=mp4_output_root, log_folder=None, down_sample_factor=1)
+				# Testing for extracting timestamps from exported mp4 files.
+				exported_mp4_timestamps = get_timestamp_from_mp4(curr_mp4_output_path)
+				print(f"Exported mp4 timestamps: {exported_mp4_timestamps.shape}")
+			
 
 
 def main(args):
@@ -555,6 +735,8 @@ def main(args):
 			align_all_anno_with_slam_close_loop(args)
 		elif step == "generate_smpl_converted_anno":
 			generate_smpl_converted_anno(args)
+		elif step == "convert_vrs_to_mp4":
+			convert_all_vrs_to_mp4(args)
 	  
 
 

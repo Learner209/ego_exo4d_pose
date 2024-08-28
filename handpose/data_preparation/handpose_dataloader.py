@@ -437,6 +437,7 @@ class hand_pose_anno_loader:
 
 	def load_frame_cam_pose(self, frame_idx, cam_pose, aria_cam_name):
 		# Check if current frame has corresponding camera pose
+		# returns: curr_cam_intrinsic: (3,3), curr_cam_extrinsics: (3,4)
 		if (
 			aria_cam_name not in cam_pose.keys()
 			or "camera_intrinsics" not in cam_pose[aria_cam_name].keys()
