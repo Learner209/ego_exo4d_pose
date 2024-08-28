@@ -16,7 +16,7 @@ def create_arg_parse():
         "--steps",
         type=str,
         nargs="+",
-        default=["aria_calib", "gt_anno", "raw_image", "undistorted_image"],
+        default=["aria_calib", "hand_gt_anno", "body_gt_anno", "raw_image", "undistorted_image"],
         help="""
             Determine which step should be executed in data preparation:
             - aria_calib: Generate aria calibration JSON file for easier loading
@@ -29,7 +29,7 @@ def create_arg_parse():
         "--anno_types",
         type=str,
         nargs="+",
-        default=["manual"],
+        default=["manual", "auto"],
         help="Type of annotation: use manual or automatic data",
     )
 
@@ -65,7 +65,8 @@ def create_arg_parse():
     for step in args.steps:
         assert step in [
             "aria_calib",
-            "gt_anno",
+            "hand_gt_anno",
+            "body_gt_anno",
             "raw_image",
             "undistorted_image",
         ], f"Invalid step: {step}"
