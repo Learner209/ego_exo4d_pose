@@ -211,11 +211,15 @@ class body_pose_anno_loader:
 
 			all_body_annot_valid = np.ones((len(egoexo_cam_names),), dtype=bool)
 
-			for curr_ind, (curr_intr, curr_extr, curr_egoexo_cam_mask, curr_ego_exo_cam_name) in zip(curr_intrs.values(), curr_extrs.values(), egoexo_cam_masks.values(), egoexo_cam_names):
+			# TODO: `valid_3d_kpts_flag` can server as a global flag for all validation across exocams or a local flag in each iteration to promise more flexibility.
+			valid_3d_kpts_flag = np.ones((self.num_joints,), dtype=bool)
+			# valid_3d_kpts_flag[np.isnan(np.mean(curr_body_3d_kpts, axis=1))] = False
+
+			for curr_ind, (curr_intr, curr_extr, curr_egoexo_cam_mask, curr_ego_exo_cam_name) in enumerate(zip(curr_intrs.values(), curr_extrs.values(), egoexo_cam_masks.values(), egoexo_cam_names)):
 				# Look at each body in current frame
 				curr_frame_anno = defaultdict(dict)
 				this_body_anno_valid = False
-				valid_3d_kpts_flag = np.ones((self.num_joints,), dtype=bool)
+				# valid_3d_kpts_flag = np.ones((self.num_joints,), dtype=bool)
 
 				# Get current body's 2D kpts and 3D world kpts
 				body_idx = 0
@@ -269,7 +273,7 @@ class body_pose_anno_loader:
 					this_body_filtered_anno_2d_kpts,
 					self.reproj_error_threshold,
 				)
-				valid_3d_kpts_flag = valid_proj_2d_flag * valid_reproj_flag
+				valid_3d_kpts_flag = valid_proj_2d_flag * valid_reproj_flag * valid_3d_kpts_flag
 
 				# Prepare 2d kpts, 3d kpts, bbox and flag data based on number of valid 3D kpts
 				if sum(valid_3d_kpts_flag) >= self.valid_kpts_threshold:
@@ -287,16 +291,16 @@ class body_pose_anno_loader:
 							self.undist_img_dim,
 							self.bbox_padding,
 						)
-					# logger.info(f"Frame successes! [{frame_idx}]/[{curr_ego_exo_cam_name}] achieved {sum(valid_3d_kpts_flag)}/{self.num_joints} valid 3d kpts. \
-					# 			fail 2d anno kpts: {sum(in_miss_anno_2d_flag)}/{self.num_joints} \
-					# 			passed 2d proj in frames: {sum(valid_proj_2d_flag)}/{self.num_joints}. \
-					# 			passed 3d-2d reproj err tests: {sum(valid_reproj_flag)}/{self.num_joints}")
+					logger.info(f"Frame successes! [{frame_idx}]/[{curr_ego_exo_cam_name}] achieved {sum(valid_3d_kpts_flag)}/{self.num_joints} valid 3d kpts. \
+								fail 2d anno kpts: {sum(in_miss_anno_2d_flag)}/{self.num_joints} \
+								passed 2d proj in frames: {sum(valid_proj_2d_flag)}/{self.num_joints}. \
+								passed 3d-2d reproj err tests: {sum(valid_reproj_flag)}/{self.num_joints}")
 				# If no valid annotation for current body, assign empty bbox, anno and valid flag only for this cam.
 				else:
-					# logger.info(f"Frame fails! [{frame_idx}]/[{curr_ego_exo_cam_name}] achieved {sum(valid_3d_kpts_flag)}/{self.num_joints} valid 3d kpts. \
-					# 			fail 2d anno kpts: {sum(in_miss_anno_2d_flag)}/{self.num_joints} \
-					# 			passed 2d proj in frames: {sum(valid_proj_2d_flag)}/{self.num_joints}. \
-					# 			passed 3d-2d reproj err tests: {sum(valid_reproj_flag)}/{self.num_joints}, missing left-ankle: {miss_left_ankle_flag}, missing right-ankle: {miss_right_ankle_flag}.")
+					logger.info(f"Frame fails! [{frame_idx}]/[{curr_ego_exo_cam_name}] achieved {sum(valid_3d_kpts_flag)}/{self.num_joints} valid 3d kpts. \
+								fail 2d anno kpts: {sum(in_miss_anno_2d_flag)}/{self.num_joints} \
+								passed 2d proj in frames: {sum(valid_proj_2d_flag)}/{self.num_joints}. \
+								passed 3d-2d reproj err tests: {sum(valid_reproj_flag)}/{self.num_joints}, missing left-ankle: {miss_left_ankle_flag}, missing right-ankle: {miss_right_ankle_flag}.")
 					this_body_bbox = np.array([])
 					this_body_filtered_anno_2d_kpts = np.array([])
 
@@ -304,30 +308,36 @@ class body_pose_anno_loader:
 				curr_frame_anno["body_bbox"][curr_ego_exo_cam_name] = this_body_bbox.tolist()
 				all_body_annot_valid[curr_ind] = this_body_anno_valid
 
-			# Compose current body GT info in current frame
-			# Assign original hand left/right ankle 3d kpts back (needed for offset left/right ankle to determine floor heights)
-			body_filtered_3d_kpts_world = curr_body_3d_kpts.copy()
-			body_filtered_3d_kpts_world[~valid_3d_kpts_flag] = None
-			body_filtered_3d_kpts_world[left_ankle_idx] = curr_body_3d_kpts[left_ankle_idx]
-			body_filtered_3d_kpts_world[right_ankle_idx] = curr_body_3d_kpts[right_ankle_idx]
-
-			assert sum(np.isnan(body_filtered_3d_kpts_world)) == sum(~valid_3d_kpts_flag), f"Missing 3d kpts count mismatch: {sum(np.isnan(body_filtered_3d_kpts_world))} vs {sum(~valid_3d_kpts_flag)}"
-
-			curr_frame_anno[
-				"body_3d"
-			] = body_filtered_3d_kpts_world.tolist()
-			curr_frame_anno[
-				"body_valid_3d"
-			] = valid_3d_kpts_flag.tolist()
 
 			# Append current frame into GT JSON if at least one valid body exists
-			minimum_body_annot_valid = math.ceil(len(egoexo_cam_names)*0.6)
-			if sum(all_body_annot_valid)>=minimum_body_annot_valid:
+			# Empirical validation: at least 60% of cameras have valid body annotation, since 3 requires 2, 4 requires 3, 5 requires 3.
+			# minimum_body_annot_valid = math.ceil(len(egoexo_cam_names)*0.6)
+
+			# if sum(all_body_annot_valid)>=minimum_body_annot_valid:
+			if this_body_anno_valid:
+
+				# Compose current body GT info in current frame
+				# Assign original hand left/right ankle 3d kpts back (needed for offset left/right ankle to determine floor heights)
+				body_filtered_3d_kpts_world = curr_body_3d_kpts.copy()
+				body_filtered_3d_kpts_world[~valid_3d_kpts_flag] = None
+				body_filtered_3d_kpts_world[left_ankle_idx] = curr_body_3d_kpts[left_ankle_idx]
+				body_filtered_3d_kpts_world[right_ankle_idx] = curr_body_3d_kpts[right_ankle_idx]
+				valid_3d_kpts_flag[:] = ~np.isnan(np.mean(body_filtered_3d_kpts_world,axis=1)) 
+
+				assert sum(np.isnan(np.mean(body_filtered_3d_kpts_world,axis=1))) == sum(~valid_3d_kpts_flag), f"Missing 3d kpts count mismatch: {sum(np.isnan(np.mean(body_filtered_3d_kpts_world,axis=1)))} vs {sum(~valid_3d_kpts_flag)}"
+
+				curr_frame_anno[
+					"body_3d"
+				] = body_filtered_3d_kpts_world.tolist()
+				curr_frame_anno[
+					"body_valid_3d"
+				] = valid_3d_kpts_flag.tolist()
+
 				metadata = {
 					"take_uid": take_uid,
 					"take_name": take_name,
 					"frame_number": int(frame_idx),
-					"exo_cam_names": egoexo_cam_names,
+					"exo_cam_names": egoexo_cam_names.tolist(),
 					"camera_intrinsics": {k: v.tolist() for k, v in curr_intrs.items()},
 					"camera_extrinsics": {k: v.tolist() for k, v in curr_extrs.items()},
 				}

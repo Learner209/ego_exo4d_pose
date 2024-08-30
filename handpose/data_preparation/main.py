@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import os.path as osp
+from glob import glob
 
 import cv2
 import numpy as np
@@ -19,6 +20,7 @@ from third_party.ego_exo4d_egopose.handpose.data_preparation.utils.utils import 
 from egoego.utils.setup_logger import setup_logger
 from egoego.utils.geom import pose_to_T, T_to_pose
 from egoego.utils.egoexo.egoexo_utils import EgoExoUtils
+from egoego.utils.transform import aria_camera_device2opengl_pose
 from egoego.utils.aria.mps import AriaMPSService
 from projectaria_tools.utils.vrs_to_mp4_utils import get_timestamp_from_mp4, convert_vrs_to_mp4
 from third_party.ego_exo4d_egopose.handpose.data_preparation.data_conversion import EgoPoseDataPreparation
@@ -95,13 +97,15 @@ def undistort_aria_img(args):
 					)
 					continue
 				curr_undist_img_dir = os.path.join(undist_img_root, take_name)
-				if take_name in DEFICIENT_TAKE_NAMES:
-					print(
-						f"[Warning] Undistorted aria images found at {curr_undist_img_dir}. Skipped take {take_name}."
-					)
-					continue
+				# if take_name in DEFICIENT_TAKE_NAMES:
+				# 	print(
+				# 		f"[Warning] Undistorted aria images found at {curr_undist_img_dir}. Skipped take {take_name}."
+				# 	)
+				# 	continue
 				os.makedirs(curr_undist_img_dir, exist_ok=True)
 				# Extract undistorted aria images
+				num_of_imgs = len(glob(os.path.join(curr_dist_img_dir, "*.jpg")))
+				assert num_of_imgs == len(take_anno.keys()), f"Number of images {num_of_imgs} does not match number of annotations {len(take_anno)}"
 				for frame_number in tqdm(take_anno.keys(), total=len(take_anno.keys())):
 					f_idx = int(frame_number)
 					curr_undist_img_path = os.path.join(
@@ -214,7 +218,11 @@ def extract_aria_img(args):
 						frame = reader[f_idx][0].cpu().numpy()
 						frame = frame if args.portrait_view else np.rot90(frame)
 						frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-						assert cv2.imwrite(out_path, frame), out_path
+						cv2.imwrite(out_path, frame)
+						tmp=cv2.imread(out_path)
+						assert tmp is not None, out_path
+				num_of_imgs = len(glob(os.path.join(curr_take_img_output_path, "*.jpg")))
+				assert num_of_imgs == len(take_anno.keys()), f"Number of images {num_of_imgs} does not match number of annotations {len(take_anno)}"
 # endregion
 
 
@@ -543,19 +551,21 @@ def align_all_anno_with_slam_close_loop(args):
 
 			this_take_ego_cam_traj = T_to_pose(this_take_ego_cam_extrs, take_inv=True) # N x 7
 
-			this_take_aligned_anno_3d = egopose_data_preparation.align_exported_anno_to_slam_traj(take_uid=common_take_uid, 
+			this_take_aligned_anno_3d, this_take_aligned_ego_cam_traj = egopose_data_preparation.align_exported_anno_to_slam_traj(take_uid=common_take_uid, 
 															 egoexo_util_inst=egoexo_utils,
 															 this_take_ego_cam_traj = this_take_ego_cam_traj,
-															 this_take_ego_cam_int=this_take_ego_cam_intr,
+															 this_take_ego_cam_intr=this_take_ego_cam_intr,
 															 this_take_anno_3d=this_take_anno_3d,
 															 this_take_anno_3d_valid_flag=this_take_anno_3d_valid_flag)
 			this_take_body_aligned_anno_3d, this_take_hand_aligned_anno_3d = this_take_aligned_anno_3d[:, :NUM_OF_BODY_JOINTS, :], this_take_aligned_anno_3d[:, NUM_OF_BODY_JOINTS:, :]
+			this_take_opengl_ego_cam_traj = aria_camera_device2opengl_pose(this_take_aligned_ego_cam_traj)
 
 			for _, common_frame_idx in enumerate(this_take_common_frame_keys):
 				for hand_idx, hand_name in enumerate(HAND_ORDER):
 					this_take_hand_anno[common_frame_idx][f"{hand_name}_hand_3d_world"] = this_take_hand_aligned_anno_3d[common_frame_idx][hand_idx*NUM_OF_HAND_JOINTS:(hand_idx+1)*NUM_OF_HAND_JOINTS] # 21 x 3
 				 
 				this_take_body_anno[common_frame_idx]["body_3d"] = this_take_body_aligned_anno_3d[common_frame_idx] # 17 x 3
+				this_take_body_anno[common_frame_idx]["ego_cam_traj"] = this_take_opengl_ego_cam_traj[common_frame_idx] # 7
 			
 			body_anno[common_take_uid] = this_take_body_anno
 			hand_anno[common_take_uid] = this_take_hand_anno
@@ -631,6 +641,8 @@ def generate_smpl_converted_anno(args):
 				this_take_aligned_frame_body_anno_3d_valid_flag = this_take_aligned_frame_body_anno["body_valid_3d"] # 17 x 3
 				this_take_aligned_body_anno_3d_body.append(this_take_aligned_frame_body_anno_3d_body)
 				this_take_aligned_body_anno_3d_valid_flag.append(this_take_aligned_frame_body_anno_3d_valid_flag)
+
+				smplh_aligned_anno[common_take_uid][common_frame_idx]["ego_cam_traj"] = this_take_aligned_frame_body_anno["ego_cam_traj"]
 			 
 			this_take_aligned_body_anno_3d_body = np.stack(this_take_aligned_body_anno_3d_body, axis=0)  # N x 17 x 3
 			this_take_aligned_body_anno_3d_valid_flag = np.stack(this_take_aligned_body_anno_3d_valid_flag, axis=0) # N x 17 x 3
@@ -644,8 +656,8 @@ def generate_smpl_converted_anno(args):
 																  this_take_anno_3d_valid_flag=this_take_aligned_anno_3d_valid_flag,
 																seq_name=common_take_name)
 
-			smplh_aligned_anno[common_take_uid][common_frame_idx]["smplh_aligned_pose"] = this_take_smplh_anno_3d # T x 52 x 3
-			smplh_aligned_anno[common_take_uid][common_frame_idx]["metadata"] = this_take_aligned_hand_anno["metadata"]
+			smplh_aligned_anno[common_take_uid]["smplh_aligned_pose"] = this_take_smplh_anno_3d # T x 52 x 3
+			smplh_aligned_anno[common_take_uid]["metadata"] = this_take_aligned_hand_anno["metadata"]
 
 		smplh_anno_output_dir = os.path.join(
 			args.gt_output_dir, "annotation", anno_type

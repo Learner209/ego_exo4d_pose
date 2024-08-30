@@ -30,7 +30,12 @@ from egoego.utils.setup_logger import setup_logger
 from egoego.simple_ik import simple_ik_solver_w_smplh
 from egoego.smplx_utils import SMPLXUtils
 from egoego.vis.utils import gen_full_body_vis
+from egoego.utils.geom import align_to_reference_pose, rotate_at_frame_smplh
 from egoego.config import default_cfg as CFG
+
+from egoego.utils.aria.mps import AriaMPSService
+from egoego.utils.egoexo.egoexo_utils import EgoExoUtils
+from projectaria_tools.utils.vrs_to_mp4_utils import get_timestamp_from_mp4, convert_vrs_to_mp4
 
 import matplotlib.pyplot as plt
 from human_body_prior.body_model.body_model import BodyModel
@@ -47,7 +52,7 @@ SMPLH_JOINT_NAMES = USED_SMPLH_JOINT_NAMES
 class EgoPoseDataPreparation:
 	def __init__(self, args):
 		self.args = args
-		self.ego4d_data_dir = args.ego4d_data_dir
+		self.egoexo_root_path = args.ego4d_data_dir
 		self.gt_output_dir = args.gt_output_dir
 		self.portrait_view = args.portrait_view
 		self.valid_kpts_num_thresh = args.valid_kpts_num_thresh
@@ -58,11 +63,66 @@ class EgoPoseDataPreparation:
 		# Load calibration
 		# self.calib = calibration.Calibration(self.ego4d_data_dir)
 
-		# Load interested takes
-		self.interested_takes = get_interested_take(self.ego4d_data_dir, self.ego_pose_takes)
+	def align_exported_anno_to_slam_traj(self, take_uid, egoexo_util_inst: EgoExoUtils, this_take_ego_cam_traj, this_take_ego_cam_intr, this_take_anno_3d, this_take_anno_3d_valid_flag):
+		"""
+		Aligns exported annotations to SLAM traj data for a given take.
 
-	def align_exported_anno_to_slam_traj(self, exported_annotation, reference_slam_traj):
-		pass
+		Parameters
+		----------
+		take_uid : str
+			Unique identifier for the take.
+		egoexo_util_inst : EgoExoUtils
+			An instance of the EgoExoUtils class, which provides utility functions and data related to the take.
+		this_take_ego_cam_traj : ndarray, shape (N, 7)
+		this_take_ego_cam_intr : ndarray of shape (N, 3, 3)
+		this_take_anno_3d : ndarray, shape (T, J, 3)
+			The 3D annotations for the take, where T is the number of frames, J is the number of joints.
+		this_take_anno_3d_valid_flag : ndarray, shape (T, J)
+			A boolean array indicating the validity of each 3D annotation.
+		reference_slam_traj : ndarray of shape (T', 7)
+
+		Returns
+		-------
+		this_take_aligned_3d : ndarray, shape (T, J, 3)
+		this_take_aligned_ego_cam_traj : ndarray, shape (T, 7)
+		
+		"""
+
+		take_name = egoexo_util_inst.take_uid_to_take_names[take_uid]
+		exported_mp4_file_path = egoexo_util_inst.get_exported_mp4_path_from_take_name(take_name=take_name, gt_output_dir=self.gt_output_dir)
+
+		_, take_name, take, open_loop_traj_path, close_loop_traj_path, gopro_calibs_path, cam_pose_anno_path, vrs_path, vrs_noimagestreams_path, online_calib_json_path = egoexo_util_inst.get_take_metadata_from_take_uid(take_uid)
+		aria_mps_serv = AriaMPSService(vrs_file_path=vrs_path,
+								vrs_exported_mp4_path = exported_mp4_file_path,
+								take=take,
+								open_loop_traj_path=open_loop_traj_path,
+								close_loop_traj_path=close_loop_traj_path,
+								gopro_calibs_path=gopro_calibs_path,
+								cam_pose_anno_path=cam_pose_anno_path,
+								generalized_eye_gaze_path=None,
+								calibrated_eye_gaze_path=None,
+								online_calib_json_path=online_calib_json_path,
+								wrist_and_palm_poses_path=None)
+
+	
+		exported_vrs_timestamps = aria_mps_serv.get_timestamps_from_exported_mp4()
+		
+		sampled_mps_close_traj_pose, T_world_imus_w_close_traj, tracking_timestamp_close_traj, utc_close_traj = aria_mps_serv.sample_close_loop_traj_from_timestamps(timestamps=exported_vrs_timestamps)
+		sampled_mps_open_traj_pose, T_world_imus_w_open_traj, tracking_timestamp_open_traj, utc_open_traj = aria_mps_serv.sample_open_loop_traj_from_timestamps(timestamps=exported_vrs_timestamps)
+
+		aligned_traj_trans, aligned_traj_rot_mat, aligned_traj_quat_wxyz, to_align2ref_rot_seq, move_to_ref_trans = align_to_reference_pose(this_take_ego_cam_traj[None,], sampled_mps_close_traj_pose[None,])
+		aligned_traj_trans, aligned_traj_rot_mat, aligned_traj_quat_wxyz = aligned_traj_trans[0], aligned_traj_rot_mat[0], aligned_traj_quat_wxyz[0]
+		this_take_aligned_ego_cam_traj = np.concatenate([aligned_traj_trans, aligned_traj_quat_wxyz], axis=1) # T x 7
+
+		this_take_aligned_3d = (to_align2ref_rot_seq @ this_take_anno_3d.transpose(1,2)).transpose(1,2) # T x J x 3
+		this_take_aligned_3d -= move_to_ref_trans[:,None] # T x J x 3
+
+        # Make sure the aligned 3D annotations has their ankle heights on the z=0 plane.
+		this_take_root_height_3d, has_left_ankle_flag, has_right_ankle_flag = self.extract_ankle_height(this_take_aligned_3d, this_take_anno_3d_valid_flag)
+		this_take_floor_height_3d = this_take_root_height_3d - CFG.empirical_val.ankle_floor_height_offset
+		this_take_aligned_3d[:,:,2] -= this_take_floor_height_3d[:,None] # T x J x 3
+
+		return this_take_aligned_3d, this_take_aligned_ego_cam_traj
 	
 	def predict_pelvis_origin(self, this_take_anno_3d, this_take_anno_3d_valid_flag):
 		"""
@@ -139,7 +199,6 @@ class EgoPoseDataPreparation:
 
 
 		pred_pelvis_origin_valid = []
-		all_pred_pelvis_origins = np.full((T, 3), np.nan)
 
 		for frame_ind in tqdm(range(T), total=T, desc="Predicting pelvis origin", ascii=' >='):
 			# ! Perform DBSCAN clustering on the num_of_jnts vels between the current frame and the prev frame to `find the most likely global orient`
@@ -184,6 +243,64 @@ class EgoPoseDataPreparation:
 		pred_pelvis_origin_valid = np.stack(pred_pelvis_origin_valid, axis=0) # T x 3
 
 		return pred_pelvis_origin_valid
+	
+	def extract_ankle_height(self, this_take_anno_3d, this_take_anno_3d_valid_flag):
+		"""
+		Extracts the average height of the left and right ankles for each frame in a dataset.
+
+		Parameters
+		----------
+		this_take_anno_3d : np.ndarray
+			3D annotations for each joint per timestep. Shape (T, J, D) where T is the number of timesteps, J is the number of joints, and D is the dimension of the coordinates (3 for x, y, z).
+		this_take_anno_3d_valid_flag : np.ndarray
+			Validity flags for the annotations, indicating whether a joint's data is valid (1) or missing (0). Shape matches `this_take_anno_3d` in the first two dimensions (T, J).
+
+		Returns
+		-------
+		this_take_root_height_3d : np.ndarray
+			The average z-coordinate (height) of the left and right ankles for each timestep. Shape (T,).
+		has_left_ankle_flag : np.ndarray
+			Boolean array indicating presence of left ankle data per timestep. Shape (T,).
+		has_right_ankle_flag : np.ndarray
+			Boolean array indicating presence of right ankle data per timestep. Shape (T,).
+
+		Raises
+		------
+		AssertionError
+			If both left and right ankles are missing in any timestep or if any required joint data is missing entirely.
+
+		"""
+
+		T, J, D = this_take_anno_3d.shape
+
+		assert J == len(BODY_JOINTS) + len(HAND_JOINTS), f"The input 3D annotation should have {len(BODY_JOINTS) + len(HAND_JOINTS)} joints"
+		assert D == 3, "The input 3D annotation should have 3D coordinates"
+
+		this_take_body_anno_3d, this_take_hand_anno_3d = this_take_anno_3d[:len(BODY_JOINTS)], this_take_anno_3d[len(BODY_JOINTS):]
+		this_take_body_anno_3d_valid_flag, this_take_hand_anno_3d_valid_flag = this_take_anno_3d_valid_flag[:len(BODY_JOINTS)], this_take_anno_3d_valid_flag[len(BODY_JOINTS):]
+		# T x (body_jnts), T x (hand_jnts)
+
+		left_ankle_idx = BODY_JOINTS.index("left-ankle")
+		right_ankle_idx = BODY_JOINTS.index("right-ankle")
+
+		miss_left_ankle_flag = (~this_take_body_anno_3d_valid_flag)[:,left_ankle_idx]
+		miss_right_ankle_flag = (~this_take_body_anno_3d_valid_flag)[:,right_ankle_idx]
+
+		assert np.any(np.logical_and(miss_left_ankle_flag, miss_right_ankle_flag)), "Both left ankle and right ankle are missing, skip this body"
+		assert np.any(np.isnan(this_take_body_anno_3d_valid_flag.mean(axis=1))), f"{sum(np.isnan(this_take_anno_3d_valid_flag.mean(axis=1)))} joints are missing, skip this body"
+
+		tmp_body_anno_3d_w_left_ankle = this_take_body_anno_3d.copy()
+		tmp_body_anno_3d_w_right_ankle = this_take_body_anno_3d.copy()
+		# A little hack since both the left and right ankle could not be missing at the same time.
+		tmp_body_anno_3d_w_left_ankle[miss_left_ankle_flag,left_ankle_idx] = tmp_body_anno_3d_w_right_ankle[miss_left_ankle_flag,left_ankle_idx]
+		tmp_body_anno_3d_w_right_ankle[miss_right_ankle_flag,right_ankle_idx] = tmp_body_anno_3d_w_left_ankle[miss_right_ankle_flag,right_ankle_idx]
+		
+		this_take_root_height_3d = np.mean(np.concatenate([tmp_body_anno_3d_w_left_ankle[:,left_ankle_idx],tmp_body_anno_3d_w_right_ankle[:,right_ankle_idx]]), axis=1) # T
+		has_left_ankle_flag = ~miss_left_ankle_flag
+		has_right_ankle_flag = ~miss_left_ankle_flag
+		return this_take_root_height_3d, has_left_ankle_flag, has_right_ankle_flag
+
+
 
 	def predict_hip_trans(self, this_take_anno_3d, this_take_anno_3d_valid_flag):
 		"""
@@ -238,10 +355,37 @@ class EgoPoseDataPreparation:
 		this_take_trans_hip[:,2] += 0.05 # T x 3
 		return this_take_trans_hip
 
-	def generate_smpl_converted_anno(self, this_take_anno_3d, this_take_anno_3d_valid_flag, pred_pelvis_origins):
-	
+	def generate_smpl_converted_anno(self, this_take_anno_3d, this_take_anno_3d_valid_flag, seq_name):
+		"""
+		Converts 3D annotations to the SMPL-H format, computes transformations, and visualizes the results.
 
+		Parameters
+		----------
+		this_take_anno_3d : ndarray
+			The 3D annotations for the take with shape (T, J, 3), where T is the number of frames, J is the number of joints.
+		this_take_anno_3d_valid_flag : ndarray
+			A boolean array indicating the validity of each 3D annotation with shape (T, J).
+		seq_name : str
+			The sequence name used for visualization and file naming.
 
+		Returns
+		-------
+		tuple
+			A tuple containing:
+			- ndarray: Converted SMPL-H 3D annotations (T, 52, 3).
+			- ndarray: SMPL-H vertex coordinates (T, 6890, 3).
+			- ndarray: SMPL-H face indices (T, 13776, 3).
+
+		Raises
+		------
+		AssertionError
+			If the input joint count does not match expected counts or the annotation is not in 3D format.
+
+		Notes
+		-----
+		This function uses an IK solver and the SMPL-H model to align and convert the input 3D annotations. Visualization
+		of the results is optionally provided based on configuration settings.
+		"""
 		T, J, D = this_take_anno_3d.shape
 
 		assert J == len(BODY_JOINTS) + len(HAND_JOINTS), f"The input 3D annotation should have {len(BODY_JOINTS) + len(HAND_JOINTS)} joints"
@@ -280,6 +424,11 @@ class EgoPoseDataPreparation:
 			plt.show()
 
 		smplx_utils = SMPLXUtils(CFG.smplh.smplh_root_path)
+
+		opt_this_take_smplh_anno_3d = []  # jnts
+		opt_this_take_smplh_verts = []
+		opt_this_take_smplh_faces = []
+
 		for frame_ind in tqdm(range(T), total=T, desc="Geenrating smpl converted annotation using simple ik sovler", ascii=' >='):
 			
 			this_frame_smplh_anno_3d_valid_flag = this_take_smplh_anno_3d_valid_flag[frame_ind] # 52
@@ -297,41 +446,51 @@ class EgoPoseDataPreparation:
 									target_mask=torch.from_numpy(this_frame_smplh_anno_3d_valid_flag).to(device),
 									transl=this_frame_hip_trans,
 									global_orient=this_frame_pelvis_origin,
-									device=device)
+									device=device) # 52 x 3
 
-			this_frame_hip_trans = this_frame_hip_trans.unsqueeze(0)
-			opt_local_aa_rep  = opt_local_aa_rep.unsqueeze(0)
-			smplh_betas = torch.zeros(1, 10)
-			smplh_betas = smplh_betas.unsqueeze(0)
+			this_frame_hip_trans = this_frame_hip_trans[None, None] # BS(1) x T x 3
+			opt_local_aa_rep  = opt_local_aa_rep[None, None] # BS(1) x T x 52 x 3
+			smplh_betas = torch.zeros(1, 16)
+			smplh_betas = smplh_betas.unsqueeze(0) # BS(1) x 16
 
 			opt_pred_smplh_jnts, opt_pred_smplh_verts, opt_pred_smplh_faces = smplx_utils.run_smpl_model(this_frame_hip_trans, opt_local_aa_rep, smplh_betas, smplx_utils.bm_dict[CFG.smplh.smplh_model])
-			# B(1) x T x 52 x 3, B(1) x T x 6890 x 3, 13776 x 3
+			# B(1) x T(1) x 52 x 3, B(1) x T(1) x 6890 x 3, 13776 x 3
+
 			dest_mesh_vis_folder = CFG.io.save_mesh_vis_folder
 			os.makedirs(dest_mesh_vis_folder, exist_ok=True)
 			gen_full_body_vis(opt_pred_smplh_verts[0], opt_pred_smplh_faces, dest_mesh_vis_folder, seq_name, vis_gt=False)
 
-		import matplotlib.pyplot as plt
+			opt_this_take_smplh_anno_3d.append(opt_pred_smplh_jnts[0,0].detach().cpu().numpy())
+			opt_pred_smplh_verts.append(opt_pred_smplh_jnts[0,0].detach().cpu().numpy())
+			opt_pred_smplh_faces.append(opt_pred_smplh_faces.detach().cpu().numpy())
 
-		fig = plt.figure()
-		ax = fig.add_subplot(projection='3d')
-		RADIUS = 1.0
-		target_joints = target_joints.detach().cpu().numpy()
-		xroot, yroot, zroot = target_joints[0,
-											0], target_joints[0, 1], target_joints[0, 2]
-		ax.set_xlim3d([-RADIUS + xroot, RADIUS + xroot])
-		ax.set_zlim3d([-RADIUS + zroot, RADIUS + zroot])
-		ax.set_ylim3d([-RADIUS + yroot, RADIUS + yroot])
+			if VIZ_PLOTS:
+				fig = plt.figure()
+				ax = fig.add_subplot(projection='3d')
+				RADIUS = 1.0
+				opt_pred_smplh_jnts_vis = opt_pred_smplh_jnts[0].detach().cpu().numpy()
+				xroot, yroot, zroot = opt_pred_smplh_jnts_vis[0,
+													0], opt_pred_smplh_jnts_vis[0, 1], opt_pred_smplh_jnts_vis[0, 2]
+				ax.set_xlim3d([-RADIUS + xroot, RADIUS + xroot])
+				ax.set_zlim3d([-RADIUS + zroot, RADIUS + zroot])
+				ax.set_ylim3d([-RADIUS + yroot, RADIUS + yroot])
 
-		ax.scatter(target_joints[:, 0], target_joints[:, 1],
-				target_joints[:, 2], c='b', marker='x')
-		# ax.scatter(opt_joints[:, 0], opt_joints[:, 1],
-		#            opt_joints[:, 2], c='r', marker='o')
-		ax.grid(True)
-		ax.set_xlabel('X')
-		ax.set_ylabel('Y')
-		ax.set_zlabel('Z')
+				ax.scatter(opt_pred_smplh_jnts_vis[:, 0], opt_pred_smplh_jnts_vis[:, 1],
+						opt_pred_smplh_jnts_vis[:, 2], c='b', marker='x')
+				# ax.scatter(opt_joints[:, 0], opt_joints[:, 1],
+				#            opt_joints[:, 2], c='r', marker='o')
+				ax.grid(True)
+				ax.set_xlabel('X')
+				ax.set_ylabel('Y')
+				ax.set_zlabel('Z')
 
-		plt.show()
+				plt.show()
+			
+		opt_this_take_smplh_anno_3d = np.stack(opt_this_take_smplh_anno_3d, axis=0) # T x 52 x 3
+		opt_this_take_smplh_verts = np.stack(opt_this_take_smplh_verts, axis=0) # T x 6890 x 3
+		opt_this_take_smplh_faces = np.stack(opt_this_take_smplh_faces, axis=0) #  T x 13776 x 3
+
+		return opt_this_take_smplh_anno_3d, opt_this_take_smplh_verts, opt_this_take_smplh_faces
 			
 	def convert_to_smplh_convention(self, this_take_anno_3d, this_take_anno_3d_valid_flag):
 		"""
