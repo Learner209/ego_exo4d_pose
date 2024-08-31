@@ -18,9 +18,9 @@ from utils.reader import PyAvReader
 from utils.utils import extract_aria_calib_to_json, get_ego_aria_cam_name
 from third_party.ego_exo4d_egopose.handpose.data_preparation.utils.utils import HAND_ORDER
 from egoego.utils.setup_logger import setup_logger
-from egoego.utils.geom import pose_to_T, T_to_pose
+from egoego.utils.transformation import T_to_qpose, qpose_to_T
 from egoego.utils.egoexo.egoexo_utils import EgoExoUtils
-from egoego.utils.transform import aria_camera_device2opengl_pose
+from egoego.utils.ego_geom import aria_camera_device2opengl_pose
 from egoego.utils.aria.mps import AriaMPSService
 from projectaria_tools.utils.vrs_to_mp4_utils import get_timestamp_from_mp4, convert_vrs_to_mp4
 from third_party.ego_exo4d_egopose.handpose.data_preparation.data_conversion import EgoPoseDataPreparation
@@ -549,7 +549,7 @@ def align_all_anno_with_slam_close_loop(args):
 			this_take_ego_cam_extrs = np.stack(this_take_ego_cam_extrs, axis=0) # N x 3 x 4
 			this_take_ego_cam_intrs = np.stack(this_take_ego_cam_intrs, axis=0) # N x 3 x 3
 
-			this_take_ego_cam_traj = T_to_pose(this_take_ego_cam_extrs, take_inv=True) # N x 7
+			this_take_ego_cam_traj = T_to_qpose(this_take_ego_cam_extrs, take_inv=True) # N x 7
 
 			this_take_aligned_anno_3d, this_take_aligned_ego_cam_traj = egopose_data_preparation.align_exported_anno_to_slam_traj(take_uid=common_take_uid, 
 															 egoexo_util_inst=egoexo_utils,
