@@ -31,7 +31,8 @@ from egoego.simple_ik import simple_ik_solver_w_smplh
 from egoego.smplx_utils import SMPLXUtils
 from egoego.vis.utils import gen_full_body_vis
 from egoego.utils.ego_geom import rotate_at_frame_smplh, align_to_reference_pose
-from egoego.config import default_cfg as CFG
+from egoego.config import get_cfg_defaults
+CFG = get_cfg_defaults()
 
 from egoego.utils.aria.mps import AriaMPSService
 from egoego.utils.egoexo.egoexo_utils import EgoExoUtils
